@@ -174,10 +174,10 @@ async function boot(session) {
   const [sites, settings, people] = await Promise.all([
     q(sb.from("sites").select("*").order("sort")),
     q(sb.from("settings").select("*").eq("id", 1).maybeSingle()),
-    q(sb.from("profiles").select("id,full_name,role,is_dc,active,site").order("full_name"))
+    q(sb.from("profiles").select("id,full_name,role,is_dc,active,site,phone,cm_role").order("full_name"))
   ]);
   S.sites = sites; S.settings = settings || {}; S.people = people; document.title = BRAND();
-  const saved = localStorage.getItem("cib_site");
+  const saved = localStorage.getItem("dc_site");
   S.site = saved !== null && (saved === "" || sites.some(s => s.id === saved)) ? saved : (S.me.site || (sites[0] || {}).id || "");
   shell(); bumpIdle(); route();
 }
@@ -212,7 +212,7 @@ sb.auth.onAuthStateChange((ev, session) => {
 });
 
 /* ---------------- shell & routing ---------------- */
-const NAV = [["home", "Home"], ["check", "Checklist"], ["mfa", "MFA log"], ["racks", "Racks"], ["issues", "Issues"], ["kpi", "KPIs"], ["admin", "Admin"]];
+const NAV = [["home", "Home"], ["check", "Checklist"], ["mfa", "MFA log"], ["racks", "Racks"], ["issues", "Issues"], ["changes", "Changes"], ["kpi", "KPIs"], ["admin", "Admin"]];
 function shell() {
   $("#root").innerHTML = `<header><div class="hbar">
       <div class="brand">${esc(BRAND())}<small>OPERATIONS PORTAL</small></div>
@@ -227,15 +227,16 @@ function shell() {
   $("#chpw").onclick = () => passwordView(false);
   refreshDots();
 }
-function setSite(id) { S.site = id; localStorage.setItem("cib_site", id); const s = $("#siteSel"); if (s) s.value = id; route(); }
+function setSite(id) { S.site = id; localStorage.setItem("dc_site", id); const s = $("#siteSel"); if (s) s.value = id; route(); }
 async function refreshDots() {
   try {
     let qi = sb.from("issues").select("id", { count: "exact", head: true }).neq("status", "closed");
     if (S.site) qi = qi.eq("site", S.site);
-    const [iss, wit] = await Promise.all([qi,
-      sb.from("mfa_log").select("id", { count: "exact", head: true }).eq("witness_id", S.user.id).is("witness_confirmed_at", null)]);
+    const [iss, wit, chg] = await Promise.all([qi,
+      sb.from("mfa_log").select("id", { count: "exact", head: true }).eq("witness_id", S.user.id).is("witness_confirmed_at", null),
+      S.me.cm_role ? sb.from("changes").select("id,status,steps,step,requested_by").eq("status", "pending") : Promise.resolve({ data: [] })]);
     const set = (k, n) => { const d = $("#dot-" + k); if (d) { d.textContent = n; d.classList.toggle("hide", !n); } };
-    set("issues", iss.count || 0); set("mfa", wit.count || 0);
+    set("issues", iss.count || 0); set("mfa", wit.count || 0); set("changes", (chg.data || []).filter(canApprove).length);
   } catch (e) { }
 }
 addEventListener("hashchange", route);
@@ -246,7 +247,7 @@ async function route() {
   const [name, arg] = (location.hash.slice(1) || "home").split("/");
   $$("nav a").forEach(a => a.classList.toggle("on", a.dataset.nav === (name === "run" ? "check" : name === "rack" ? "racks" : name)));
   $("#view").innerHTML = `<p class="muted">Loading…</p>`;
-  const V = { home: viewHome, check: viewCheck, run: viewRun, mfa: viewMfa, racks: viewRacks, rack: viewRack, issues: viewIssues, kpi: viewKpi, admin: viewAdmin };
+  const V = { home: viewHome, check: viewCheck, run: viewRun, mfa: viewMfa, racks: viewRacks, rack: viewRack, issues: viewIssues, changes: viewChanges, kpi: viewKpi, admin: viewAdmin };
   try { await (V[name] || viewHome)(arg); }
   catch (e) { console.error(e); $("#view").innerHTML = `<div class="card">Could not load this page. ${esc(niceErr(e))}</div>`; }
   refreshDots();
@@ -260,8 +261,9 @@ async function viewHome() {
   let qr = sb.from("checklist_runs").select("id,site,shift,tech_name,signed_at,started_at").gte("started_at", from).order("started_at", { ascending: false });
   let qm = sb.from("mfa_log").select("id,site,time_in,custodian,purpose,component_id").is("time_out", null);
   let qk = sb.from("rack_usage").select("u_total,used_u,kw_cap,kw_used").eq("active", true);
-  if (S.site) { qi = qi.eq("site", S.site); qr = qr.eq("site", S.site); qm = qm.eq("site", S.site); qk = qk.eq("site", S.site); }
-  const [iss, runs, open, racks, mine] = await Promise.all([q(qi), q(qr), q(qm), q(qk),
+  let qc = sb.from("changes").select("id,status,steps,step,requested_by,planned_start").in("status", ["pending", "approved", "in_progress", "completed"]);
+  if (S.site) { qi = qi.eq("site", S.site); qr = qr.eq("site", S.site); qm = qm.eq("site", S.site); qk = qk.eq("site", S.site); qc = qc.eq("site", S.site); }
+  const [iss, runs, open, racks, chg, mine] = await Promise.all([q(qi), q(qr), q(qm), q(qk), q(qc),
     q(sb.from("mfa_log").select("id,site,time_in,custodian,purpose,created_by").eq("witness_id", S.user.id).is("witness_confirmed_at", null))]);
   const cnt = s => iss.filter(i => i.severity === s).length;
   const uT = racks.reduce((a, r) => a + r.u_total, 0), uU = racks.reduce((a, r) => a + r.used_u, 0);
@@ -275,6 +277,7 @@ async function viewHome() {
       <div class="tile click ${late ? "bad" : ""}" data-go="mfa"><div class="v">${open.length}</div><div class="l">MFA sessions still open${late ? ` · ${late} over ${hrs} h` : ""}</div></div>
       <div class="tile click ${mine.length ? "warn" : ""}" data-go="mfa"><div class="v">${mine.length}</div><div class="l">Waiting for your witness confirmation</div></div>
       <div class="tile click" data-go="racks"><div class="v">${uT ? Math.round(uU / uT * 100) : 0}%</div><div class="l">Rack space used (${uU}/${uT} U)</div></div>
+      <div class="tile click ${chg.filter(canApprove).length ? "bad" : ""}" data-go="changes"><div class="v">${chg.filter(c => c.status === "pending").length}</div><div class="l">Changes waiting approval${chg.filter(canApprove).length ? ` · <b>${chg.filter(canApprove).length} need you</b>` : ""} · ${chg.filter(c => c.status === "in_progress").length} in progress · ${chg.filter(c => c.status === "approved" && c.planned_start && dayStr(new Date(c.planned_start)) === t).length} planned today</div></div>
       <div class="tile click ${kC && kU / kC > 0.85 ? "warn" : ""}" data-go="racks"><div class="v">${kC ? Math.round(kU / kC * 100) : 0}%</div><div class="l">Rack power planned (${kU.toFixed(1)}/${kC} kW)</div></div>
     </div>
     <h2>Latest open issues</h2>
@@ -748,6 +751,254 @@ async function openIssue(id) {
   };
 }
 
+/* ---------------- CHANGE MANAGEMENT ---------------- */
+const CM_ROLES = { site_lead: "Site Lead / Team Head", deputy: "Deputy Manager", manager: "DC Manager" };
+const CM_RANK = { "": 0, site_lead: 1, deputy: 2, manager: 3 };
+const CTYPES = { standard: "Standard — routine work with a proven method", normal: "Normal", emergency: "Emergency — urgent fix to restore or protect service" };
+const CCATS = ["Electrical", "Mechanical / cooling", "Fire protection", "Security / access", "Building / civil", "IT / network", "Monitoring / BMS / DCIM", "Other"];
+const CST = { draft: "Draft", pending: "Waiting for approval", approved: "Approved", rejected: "Rejected", in_progress: "In progress", completed: "Done — waiting review", closed: "Closed", cancelled: "Cancelled" };
+const COUT = { successful: "Successful", rolled_back: "Rolled back", partial: "Partly done" };
+const CFIN = ["closed", "rejected", "cancelled"];
+const chgNo = id => "CHG-" + String(id).padStart(5, "0");
+const myRank = () => CM_RANK[(S.me && S.me.cm_role) || ""] || 0;
+const roleName = r => CM_ROLES[r] || r;
+const chgBadge = s => `<span class="badge c-${s}">${esc(CST[s] || s)}</span>`;
+const nextStep = c => c.status === "pending" ? c.steps[c.step] : null;
+const canApprove = c => c.status === "pending" && myRank() >= CM_RANK[nextStep(c)] && c.requested_by !== S.user.id;
+const canReview = c => c.status === "completed" && (isAdmin() || (myRank() >= 2 && c.requested_by !== S.user.id));
+const isMine = c => c.requested_by === S.user.id;
+function cairoInput(t) {   // timestamp -> "YYYY-MM-DDTHH:MM" in Cairo time
+  if (!t) return "";
+  const p = Object.fromEntries(new Intl.DateTimeFormat("en-GB", { timeZone: TZ, year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23" }).formatToParts(new Date(t)).map(x => [x.type, x.value]));
+  return `${p.year}-${p.month}-${p.day}T${p.hour}:${p.minute}`;
+}
+function cairoISO(v) {     // "YYYY-MM-DDTHH:MM" typed in Cairo time -> ISO
+  if (!v) return null;
+  const guess = new Date(v + ":00Z");
+  const off = new Date(guess.toLocaleString("en-US", { timeZone: TZ })) - new Date(guess.toLocaleString("en-US", { timeZone: "UTC" }));
+  return new Date(guess.getTime() - off).toISOString();
+}
+let CMX = null;
+async function loadMatrix() { if (!CMX) CMX = await q(sb.from("change_matrix").select("*")); return CMX; }
+function stepsFor(ctype, risk) { const r = (CMX || []).find(m => m.ctype === ctype && m.risk === risk); return r ? r.steps : []; }
+
+const CF = { status: "active" };
+async function viewChanges(arg) {
+  if (arg) return viewChange(arg);
+  let qc = sb.from("changes").select("id,site,title,ctype,risk,category,status,steps,step,planned_start,planned_end,requested_by,requester_name,outcome").order("id", { ascending: false }).limit(500);
+  if (S.site) qc = qc.eq("site", S.site);
+  const all = await q(qc);
+  const list = all.filter(c => CF.status === "active" ? !CFIN.includes(c.status) : CF.status === "mine" ? canApprove(c) : CF.status === "done" ? CFIN.includes(c.status) : true)
+    .sort((a, b) => (CFIN.includes(a.status) - CFIN.includes(b.status)) || (new Date(a.planned_start || 0) - new Date(b.planned_start || 0)));
+  const n = s => all.filter(c => c.status === s).length;
+  const mine = all.filter(canApprove).length;
+  const soon = all.filter(c => c.status === "approved" && c.planned_start && new Date(c.planned_start) - Date.now() < 7 * 864e5).length;
+  $("#view").innerHTML = `<h1>Change management — ${esc(siteName(S.site))}</h1>
+    <div class="tiles">
+      <div class="tile click ${mine ? "bad" : ""}" data-cf="mine"><div class="v">${mine}</div><div class="l">Waiting for <b>your</b> approval${S.me.cm_role ? "" : " (you are not an approver)"}</div></div>
+      <div class="tile ${n("pending") ? "warn" : ""}"><div class="v">${n("pending")}</div><div class="l">Waiting for approval</div></div>
+      <div class="tile"><div class="v">${n("approved")}</div><div class="l">Approved · ${soon} in the next 7 days</div></div>
+      <div class="tile ${n("in_progress") ? "warn" : ""}"><div class="v">${n("in_progress")}</div><div class="l">Work in progress</div></div>
+      <div class="tile ${n("completed") ? "warn" : ""}"><div class="v">${n("completed")}</div><div class="l">Done — waiting review</div></div>
+    </div>
+    <div class="row" style="margin:14px 0">
+      <select id="cfs"><option value="active">Open changes</option><option value="mine">Waiting for my approval</option><option value="done">Closed / rejected / cancelled</option><option value="all">All</option></select>
+      <div class="grow"></div><button class="btn sm" id="ccsv">⬇ CSV</button>${canEdit() ? `<button class="btn acc" id="nc">＋ New change request</button>` : ""}</div>
+    ${list.length ? `<div class="tw"><table class="t"><tr><th>No.</th><th>Change</th><th>Site</th><th>Type</th><th>Risk</th><th>Planned window</th><th>Status</th><th>Next approval</th></tr>
+      ${list.map(c => `<tr class="click" data-chg="${c.id}"><td class="nowrap">${chgNo(c.id)}</td><td>${esc(c.title)}<br><span class="small muted">${esc(c.category)} · by ${esc(c.requester_name || "")}</span></td><td>${esc(c.site)}</td>
+        <td>${c.ctype === "emergency" ? `<span class="badge b-critical">emergency</span>` : esc(c.ctype)}</td><td>${sevBadge(c.risk)}</td>
+        <td class="nowrap small">${fmtDT(c.planned_start)}<br>→ ${fmtDT(c.planned_end)}</td><td>${chgBadge(c.status)}${c.outcome && c.outcome !== "successful" ? `<br><span class="small" style="color:var(--bad)">${esc(COUT[c.outcome])}</span>` : ""}</td>
+        <td class="small">${c.status === "pending" ? `${esc(roleName(nextStep(c)))} <span class="muted">(${c.step + 1}/${c.steps.length})</span>${canApprove(c) ? ` <span class="badge b-high">you</span>` : ""}` : ""}</td></tr>`).join("")}</table></div>`
+      : `<div class="card muted">No change requests here.${canEdit() ? ` <a href="#changes/new">Raise one</a>` : ""}</div>`}`;
+  $("#cfs").value = CF.status;
+  $("#cfs").onchange = e => { CF.status = e.target.value; route(); };
+  $$("[data-cf]").forEach(t => t.onclick = () => { CF.status = t.dataset.cf; route(); });
+  $$("[data-chg]").forEach(r => r.onclick = () => location.hash = "changes/" + r.dataset.chg);
+  const nc = $("#nc"); if (nc) nc.onclick = () => location.hash = "changes/new";
+  $("#ccsv").onclick = () => csvDownload(`Changes-${S.site || "all"}.csv`, list.map(c => ({ no: chgNo(c.id), site: c.site, title: c.title, type: c.ctype, risk: c.risk, category: c.category, status: CST[c.status], outcome: c.outcome || "", start: fmtDT(c.planned_start), end: fmtDT(c.planned_end), requester: c.requester_name })));
+}
+
+// Who signed which step: an approval entry covers every step up to the signer's role
+function stepSigners(c, log) {
+  const since = c.submitted_at ? new Date(c.submitted_at) : 0;
+  const ok = log.filter(l => l.action === "approved" && new Date(l.at) >= since);
+  return c.steps.map((r, i) => {
+    if (i >= c.step) return null;
+    return ok.find(l => CM_RANK[l.role] >= CM_RANK[r]) || null;
+  });
+}
+function approvalTrack(c, log) {
+  const steps = c.status === "draft" ? stepsFor(c.ctype, c.risk) : c.steps;
+  if (!steps.length) return `<div class="small muted">No approval step is set for this type and risk.</div>`;
+  const sig = c.status === "draft" ? [] : stepSigners(c, log);
+  return `<div class="track">${steps.map((r, i) => {
+    const s = sig[i];
+    const cur = c.status === "pending" && i === c.step;
+    const cls = s ? "done" : cur ? "cur" : (c.status === "rejected" && i === c.step) ? "rej" : "";
+    return `<div class="stp ${cls}"><div class="n">${s ? "✓" : c.status === "rejected" && i === c.step ? "✕" : i + 1}</div><div><b>${esc(roleName(r))}</b><br>
+      <span class="small muted">${s ? `${esc(s.by_name || "")} · ${fmtDT(s.at)}` : cur ? "waiting" : c.status === "draft" ? "required" : ""}</span></div></div>`;
+  }).join("")}</div>`;
+}
+function approverContacts(c) {
+  const need = nextStep(c); if (!need) return [];
+  return S.people.filter(p => p.active && p.phone && CM_RANK[p.cm_role || ""] >= CM_RANK[need] && p.id !== c.requested_by)
+    .sort((a, b) => CM_RANK[a.cm_role] - CM_RANK[b.cm_role]);
+}
+function waApprove(c, p) {
+  const url = location.origin + location.pathname + "#changes/" + c.id;
+  const msg = `${BRAND()} — change ${chgNo(c.id)} needs your approval (${roleName(nextStep(c))})\n\n${c.title}\nSite: ${c.site} · ${c.ctype} · risk ${c.risk}\nWindow: ${fmtDT(c.planned_start)} → ${fmtDT(c.planned_end)}\nRequested by: ${c.requester_name}\n\n${url}`;
+  return `https://wa.me/${p.phone}?text=${encodeURIComponent(msg)}`;
+}
+
+async function viewChange(arg) {
+  await loadMatrix();
+  const isNew = arg === "new";
+  let c, log = [];
+  if (isNew) {
+    if (!canEdit()) { $("#view").innerHTML = `<div class="card">Only operators and admins can raise a change.</div>`; return; }
+    c = { site: S.site || (S.me.site) || (S.sites[0] || {}).id, ctype: "normal", risk: "medium", category: "Electrical", status: "draft", steps: [], step: 0, requested_by: S.user.id, requester_name: S.me.full_name };
+  } else {
+    [c, log] = await Promise.all([q(sb.from("changes").select("*").eq("id", +arg).maybeSingle()),
+      q(sb.from("change_log").select("*").eq("change_id", +arg).order("at"))]);
+    if (!c) { $("#view").innerHTML = `<div class="card">Change not found. <a href="#changes">Back to the list</a></div>`; return; }
+  }
+  const editable = c.status === "draft" && canEdit() && (isMine(c) || isAdmin());
+  const dis = editable ? "" : "disabled";
+  const ta = (id, label, val, hint, rows = 3) => `<label class="f">${label}${hint ? ` <span class="muted">— ${hint}</span>` : ""}<textarea id="${id}" rows="${rows}" ${dis}>${esc(val || "")}</textarea></label>`;
+  const contacts = c.status === "pending" ? approverContacts(c) : [];
+  $("#view").innerHTML = `<div class="row" style="margin-bottom:6px"><a href="#changes" class="small">← All changes</a><div class="grow"></div>${isNew ? "" : `<button class="btn sm" id="cprint">🖨 Print</button>`}</div>
+    <h1>${isNew ? "New change request" : `${chgNo(c.id)} · ${esc(c.title)}`} ${isNew ? "" : chgBadge(c.status)}</h1>
+    ${isNew ? "" : `<div class="small muted" style="margin:-6px 0 12px">Requested by ${esc(c.requester_name || "")} · ${fmtDT(c.created_at)}${c.submitted_at ? " · submitted " + fmtDT(c.submitted_at) : ""}${c.approved_at ? " · approved " + fmtDT(c.approved_at) : ""}${c.started_at ? " · started " + fmtDT(c.started_at) : ""}${c.ended_at ? " · finished " + fmtDT(c.ended_at) : ""}</div>`}
+
+    <div class="card" style="margin-bottom:12px"><h2 style="margin-top:0">Approvals required</h2><div id="ctrack">${approvalTrack(c, log)}</div>
+      ${c.status === "pending" && canApprove(c) ? `<div class="appr"><label class="f">Your comment <span class="muted">(required to return or reject)</span><textarea id="dcm" rows="2"></textarea></label>
+        <div class="row"><button class="btn ok" data-dec="approved">✓ Approve as ${esc(roleName(S.me.cm_role))}</button><button class="btn" data-dec="returned">↩ Return for changes</button><button class="btn danger" data-dec="rejected">✕ Reject</button></div></div>` : ""}
+      ${c.status === "pending" && !canApprove(c) && contacts.length ? `<div class="small muted" style="margin-top:10px">Remind the approver on WhatsApp:</div><div class="row" style="margin-top:4px">${contacts.map(p => `<a class="btn sm" target="_blank" rel="noopener" href="${waApprove(c, p)}">💬 ${esc(p.full_name)} <span class="muted">(${esc(roleName(p.cm_role))})</span></a>`).join("")}</div>` : ""}
+      ${c.status === "pending" && !contacts.length ? `<div class="small" style="margin-top:10px;color:var(--bad)">Nobody is set as ${esc(roleName(nextStep(c)))} or above yet — an admin sets approvers in Admin → Users.</div>` : ""}
+    </div>
+
+    <form id="cform" class="card" style="margin-bottom:12px"><h2 style="margin-top:0">Request</h2>
+      <label class="f">Title<input type="text" id="c_title" value="${esc(c.title || "")}" maxlength="140" required ${dis} placeholder="e.g. Replace UPS-A battery string 2"></label>
+      <div class="grid2">
+        <label class="f">Site<select id="c_site" ${dis}>${siteOptions(c.site)}</select></label>
+        <label class="f">Category<select id="c_cat" ${dis}>${CCATS.map(x => `<option ${x === c.category ? "selected" : ""}>${esc(x)}</option>`).join("")}</select></label>
+        <label class="f">Type<select id="c_type" ${dis}>${Object.entries(CTYPES).map(([k, v]) => `<option value="${k}" ${k === c.ctype ? "selected" : ""}>${esc(v)}</option>`).join("")}</select></label>
+        <label class="f">Risk<select id="c_risk" ${dis}>${["low", "medium", "high"].map(r => `<option ${r === c.risk ? "selected" : ""}>${r}</option>`).join("")}</select></label>
+        <label class="f">Planned start (Cairo time)<input type="datetime-local" id="c_ps" value="${cairoInput(c.planned_start)}" ${dis}></label>
+        <label class="f">Planned end<input type="datetime-local" id="c_pe" value="${cairoInput(c.planned_end)}" ${dis}></label>
+        <label class="f">Equipment / systems affected<input type="text" id="c_sys" value="${esc(c.systems || "")}" ${dis} placeholder="UPS-A, PDU-3A, CRAC-2 …"></label>
+        <label class="f">Vendor / contractor<input type="text" id="c_ven" value="${esc(c.vendor || "")}" ${dis}></label>
+      </div>
+      <div class="small muted" style="margin:-4px 0 10px">Risk guide — <b>high</b>: redundancy lost or load at risk during the work (e.g. N only, live work on critical power/cooling); <b>medium</b>: redundancy reduced but kept (N+1 → N+1 with one path on bypass); <b>low</b>: no effect on critical load.</div>
+      ${ta("c_desc", "What will be done", c.description, "", 3)}
+      ${ta("c_why", "Why", c.reason, "reason / benefit", 2)}
+      ${ta("c_imp", "Impact during the work", c.impact, "service, redundancy level (N / N+1 / 2N), alarms expected, who is informed", 3)}
+      ${ta("c_mop", "Method of procedure (MOP)", c.mop, "numbered steps, isolation / LOTO points, checks after each step", 6)}
+      ${ta("c_rb", "Rollback plan", c.rollback, "how to return to normal if a step fails", 3)}
+      ${editable ? `<div class="row"><button class="btn pri" id="csave">${isNew ? "Save draft" : "Save"}</button>
+        ${isNew ? "" : `<button type="button" class="btn acc" id="csub">Submit for approval</button><div class="grow"></div><button type="button" class="btn danger" id="ccan">Cancel request</button>`}</div>` : ""}
+    </form>
+
+    ${!isNew && ["approved", "pending"].includes(c.status) && (isMine(c) || isAdmin()) ? `<div class="row" style="margin-bottom:12px"><button class="btn danger sm" id="ccan">Cancel this change</button></div>` : ""}
+    ${!isNew && c.status === "approved" && canEdit() ? `<div class="card" style="margin-bottom:12px"><h2 style="margin-top:0">Implementation</h2>
+      <div class="small muted" style="margin-bottom:8px">Start only inside the approved window, with the MOP printed and isolations agreed with the shift engineer.</div>
+      <button class="btn acc" id="cstart">▶ Start work now</button></div>` : ""}
+    ${!isNew && c.status === "in_progress" && canEdit() ? `<div class="card" style="margin-bottom:12px"><h2 style="margin-top:0">Finish the work</h2>
+      <div class="grid2"><label class="f">Result<select id="cout">${Object.entries(COUT).map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select></label></div>
+      <label class="f">Notes <span class="muted">(required if rolled back or partly done — an issue is opened automatically)</span><textarea id="cnote" rows="3"></textarea></label>
+      <button class="btn ok" id="cdone">✓ Work finished</button></div>` : ""}
+    ${!isNew && ["completed", "closed"].includes(c.status) ? `<div class="card" style="margin-bottom:12px"><h2 style="margin-top:0">Result</h2>
+      <div><b>${esc(COUT[c.outcome] || "")}</b>${c.outcome_note ? ` — ${esc(c.outcome_note)}` : ""}</div>
+      ${c.issue_id ? `<div class="small" style="margin-top:6px">Follow-up issue <a href="#" id="cissue">#${c.issue_id}</a></div>` : ""}
+      ${c.review ? `<div style="margin-top:10px"><b>Post-implementation review:</b> ${esc(c.review)}</div>` : ""}
+      ${canReview(c) ? `<label class="f" style="margin-top:10px">Post-implementation review <span class="muted">— did it go to plan, lessons, documents to update (SOP/MOP, drawings, asset register)</span><textarea id="crev" rows="3"></textarea></label>
+        <button class="btn pri" id="cclose">Close change</button>` : c.status === "completed" ? `<div class="small muted" style="margin-top:8px">Waiting for review and closure by a Deputy Manager or DC Manager.</div>` : ""}</div>` : ""}
+
+    ${isNew ? "" : `<div class="card"><h2 style="margin-top:0">History</h2>
+      <div class="tl">${log.map(l => `<div class="ev"><span class="small muted nowrap">${fmtDT(l.at)}</span> <b>${esc(l.by_name || "")}</b> ${esc(l.action)}${l.role ? ` as ${esc(roleName(l.role))}` : ""}${l.comment ? `<div class="small">${esc(l.comment)}</div>` : ""}</div>`).join("") || `<div class="muted small">Nothing yet.</div>`}</div>
+      <div class="row" style="margin-top:10px"><input type="text" id="ccm" placeholder="Add a comment" style="flex:1"><button class="btn sm" id="ccmb">Add</button></div></div>`}`;
+
+  const rpc = async (fn, args, ok) => { await q(sb.rpc(fn, args)); if (ok) toast(ok); CMX = null; route(); };
+  const formRow = () => ({
+    title: $("#c_title").value.trim(), site: $("#c_site").value, category: $("#c_cat").value, ctype: $("#c_type").value, risk: $("#c_risk").value,
+    planned_start: cairoISO($("#c_ps").value), planned_end: cairoISO($("#c_pe").value), systems: $("#c_sys").value.trim() || null, vendor: $("#c_ven").value.trim() || null,
+    description: $("#c_desc").value.trim() || null, reason: $("#c_why").value.trim() || null, impact: $("#c_imp").value.trim() || null,
+    mop: $("#c_mop").value.trim() || null, rollback: $("#c_rb").value.trim() || null
+  });
+  if (editable) {
+    const upd = () => { $("#ctrack").innerHTML = approvalTrack({ ...c, ctype: $("#c_type").value, risk: $("#c_risk").value, status: "draft" }, []); };
+    $("#c_type").onchange = upd; $("#c_risk").onchange = upd;
+    const save = async () => {
+      const row = formRow();
+      if (!row.title) { toast("Write a title", true); return null; }
+      if (row.planned_start && row.planned_end && row.planned_end <= row.planned_start) { toast("The planned end must be after the start", true); return null; }
+      if (isNew) { const r = await q(sb.from("changes").insert(row).select("id").single()); return r.id; }
+      await q(sb.from("changes").update(row).eq("id", c.id)); return c.id;
+    };
+    $("#cform").onsubmit = async e => { e.preventDefault(); const id = await save(); if (!id) return; toast("Saved"); if (isNew) location.hash = "changes/" + id; else route(); };
+    const sub = $("#csub");
+    if (sub) sub.onclick = async () => {
+      const id = await save(); if (!id) return;
+      const r = await q(sb.rpc("change_submit", { p_id: id }));
+      if (!r.ok) return toast("Fill these before submitting: " + r.missing.join(", "), true);
+      toast("Submitted for approval"); route();
+    };
+  }
+  const can = $("#ccan");
+  if (can) can.onclick = async () => {
+    const why = prompt("Why is this change cancelled?"); if (why === null) return;
+    await rpc("change_cancel", { p_id: c.id, p_comment: why }, "Change cancelled");
+  };
+  $$("[data-dec]").forEach(b => b.onclick = async () => {
+    const d = b.dataset.dec, cm = $("#dcm").value.trim();
+    if (d !== "approved" && !cm) return toast("Write the reason in the comment box", true);
+    if (d === "rejected" && !confirm("Reject this change? The requester has to raise a new request.")) return;
+    await rpc("change_decide", { p_id: c.id, p_decision: d, p_comment: cm || null }, d === "approved" ? "Approved ✓" : d === "returned" ? "Returned to the requester" : "Rejected");
+  });
+  const st = $("#cstart");
+  if (st) st.onclick = async () => {
+    const early = c.planned_start && Date.now() < new Date(c.planned_start) - 15 * 60000, late = c.planned_end && Date.now() > new Date(c.planned_end);
+    if ((early || late) && !confirm(`You are ${early ? "before" : "after"} the approved window (${fmtDT(c.planned_start)} → ${fmtDT(c.planned_end)}). Start anyway?`)) return;
+    await rpc("change_start", { p_id: c.id }, "Work started");
+  };
+  const dn = $("#cdone");
+  if (dn) dn.onclick = async () => {
+    const o = $("#cout").value, n = $("#cnote").value.trim();
+    if (o !== "successful" && !n) return toast("Describe what happened", true);
+    await rpc("change_complete", { p_id: c.id, p_outcome: o, p_note: n || null }, o === "successful" ? "Work recorded as successful" : "Recorded — follow-up issue opened");
+  };
+  const cl = $("#cclose");
+  if (cl) cl.onclick = async () => {
+    const r = $("#crev").value.trim(); if (!r) return toast("Write the review", true);
+    await rpc("change_close", { p_id: c.id, p_review: r }, "Change closed");
+  };
+  const ci = $("#cissue"); if (ci) ci.onclick = e => { e.preventDefault(); openIssue(c.issue_id); };
+  const cmb = $("#ccmb");
+  if (cmb) cmb.onclick = async () => { const t = $("#ccm").value.trim(); if (!t) return; await rpc("change_comment", { p_id: c.id, p_comment: t }, "Comment added"); };
+  const pr = $("#cprint");
+  if (pr) pr.onclick = () => printChange(c, log);
+}
+
+function printChange(c, log) {
+  const sig = stepSigners(c, log);
+  const f = (k, v) => `<tr><th style="width:26%;text-align:left;vertical-align:top;padding:5px;border:1px solid #bbb;background:#f3f5f9">${k}</th><td style="padding:5px;border:1px solid #bbb;white-space:pre-wrap">${esc(v || "")}</td></tr>`;
+  printHTML(`<h2 style="margin:0">${esc(BRAND())} — Change request ${chgNo(c.id)}</h2>
+    <div style="margin:4px 0 10px">Status: <b>${esc(CST[c.status])}</b> · printed ${fmtDT(new Date())}</div>
+    <table style="border-collapse:collapse;width:100%;font-size:12px">
+      ${f("Title", c.title)}${f("Site", siteName(c.site))}${f("Type / risk / category", `${c.ctype} / ${c.risk} / ${c.category}`)}
+      ${f("Planned window", `${fmtDT(c.planned_start)} → ${fmtDT(c.planned_end)}`)}${f("Equipment / systems", c.systems)}${f("Vendor", c.vendor)}
+      ${f("Requested by", `${c.requester_name} · ${fmtDT(c.created_at)}`)}${f("What will be done", c.description)}${f("Why", c.reason)}
+      ${f("Impact during the work", c.impact)}${f("Method of procedure", c.mop)}${f("Rollback plan", c.rollback)}
+      ${c.outcome ? f("Result", `${COUT[c.outcome]}${c.outcome_note ? " — " + c.outcome_note : ""}`) : ""}${c.review ? f("Post-implementation review", c.review) : ""}
+    </table>
+    <h3>Approvals</h3>
+    <table style="border-collapse:collapse;width:100%;font-size:12px"><tr>${c.steps.map((r, i) => `<td style="border:1px solid #bbb;padding:6px;vertical-align:top"><b>${esc(roleName(r))}</b><br>${sig[i] ? `${esc(sig[i].by_name)}<br>${fmtDT(sig[i].at)}<br>(approved in portal)` : "<br><br>Signature: ____________"}</td>`).join("")}</tr></table>
+    <h3>Implementation</h3>
+    <table style="border-collapse:collapse;width:100%;font-size:12px"><tr>
+      <td style="border:1px solid #bbb;padding:6px">Started: ${fmtDT(c.started_at) || "__________"}</td><td style="border:1px solid #bbb;padding:6px">Finished: ${fmtDT(c.ended_at) || "__________"}</td>
+      <td style="border:1px solid #bbb;padding:6px">Shift engineer: ____________</td></tr></table>`);
+}
+
 /* ---------------- KPI DASHBOARD ---------------- */
 const KR = { from: addDays(dayStr(), -29), to: dayStr() };
 async function viewKpi() {
@@ -839,7 +1090,7 @@ function hbars(obj) {
 }
 
 /* ---------------- ADMIN ---------------- */
-async function refreshPeople() { S.people = await q(sb.from("profiles").select("id,full_name,role,is_dc,active,site").order("full_name")); }
+async function refreshPeople() { S.people = await q(sb.from("profiles").select("id,full_name,role,is_dc,active,site,phone,cm_role").order("full_name")); }
 function credsModal(r, isNew) {
   const url = location.origin + location.pathname;
   const msg = `${BRAND()} portal\n${url}\n\nSign in with:\nWhatsApp number: ${showPhone(r.phone)}\nTemporary password: ${r.password}\n\nYou will choose your own password after signing in.`;
@@ -852,11 +1103,12 @@ function credsModal(r, isNew) {
 }
 async function viewAdmin() {
   if (!isAdmin()) { $("#view").innerHTML = `<div class="card">Admins only.</div>`; return; }
-  const [people, items, use, audit] = await Promise.all([
+  const [people, items, use, audit, mtx] = await Promise.all([
     q(sb.from("profiles").select("*").order("created_at")),
     q(sb.from("checklist_items").select("*").order("sort").order("id")),
     q(sb.rpc("data_usage")),
-    q(sb.from("audit_log").select("*").order("id", { ascending: false }).limit(150))]);
+    q(sb.from("audit_log").select("*").order("id", { ascending: false }).limit(150)),
+    q(sb.from("change_matrix").select("*"))]);
   const st = S.settings;
   const pctUse = Math.round(use.photo_mb / use.budget_mb * 100);
   $("#view").innerHTML = `<h1>Admin</h1>
@@ -870,13 +1122,20 @@ async function viewAdmin() {
       <label class="f" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="u_dc" checked> DC rep (may sign as MFA witness)</label>
       <div class="row" style="align-items:flex-end"><button class="btn pri">+ Add person</button></div></form>
       <div class="small muted" style="margin-top:6px">People sign in with their WhatsApp number and password. After adding someone you can send them their login on WhatsApp; they choose their own password the first time.</div></div>
-    <div class="tw"><table class="t"><tr><th>Name</th><th>WhatsApp</th><th>Role</th><th>DC rep</th><th>Home site</th><th>Active</th><th></th></tr>
+    <div class="tw"><table class="t"><tr><th>Name</th><th>WhatsApp</th><th>Role</th><th>Change approver</th><th>DC rep</th><th>Home site</th><th>Active</th><th></th></tr>
       ${people.map(p => `<tr data-p="${p.id}"><td><input type="text" data-f="full_name" value="${esc(p.full_name)}"></td><td class="small nowrap">${esc(showPhone(p.phone) || p.email || "")}${p.must_change_pw ? ` <span class="badge" title="Has not chosen a password yet">new</span>` : ""}</td>
         <td><select data-f="role">${["admin", "operator", "viewer"].map(r => `<option ${r === p.role ? "selected" : ""}>${r}</option>`).join("")}</select></td>
+        <td><select data-f="cm_role"><option value="">—</option>${Object.entries(CM_ROLES).map(([k, v]) => `<option value="${k}" ${k === p.cm_role ? "selected" : ""}>${v}</option>`).join("")}</select></td>
         <td><input type="checkbox" data-f="is_dc" ${p.is_dc ? "checked" : ""}></td>
         <td><select data-f="site"><option value="">—</option>${S.sites.map(s => `<option ${s.id === p.site ? "selected" : ""}>${esc(s.id)}</option>`).join("")}</select></td>
         <td><input type="checkbox" data-f="active" ${p.active ? "checked" : ""} ${p.id === S.user.id ? "disabled" : ""}></td>
         <td class="nowrap">${p.phone ? `<button class="btn sm" data-reset="${p.id}">Reset password</button>` : ""}${p.id !== S.user.id ? ` <button class="btn sm" data-del="${p.id}" title="Remove">🗑</button>` : ""}</td></tr>`).join("")}</table></div>
+
+    <h2>Change approval matrix</h2>
+    <div class="small muted" style="margin-bottom:6px">Which approvals each change needs, in order (Site Lead → Deputy Manager → DC Manager). A higher role may sign a lower step, and that signature also covers the next steps up to their own level. Nobody approves their own change. Closing after the work always needs a Deputy Manager or DC Manager review.</div>
+    <div class="tw" style="max-height:none"><table class="t"><tr><th>Type</th><th>Risk</th>${Object.values(CM_ROLES).map(v => `<th>${v}</th>`).join("")}</tr>
+      ${mtx.sort((a, b) => ["standard", "normal", "emergency"].indexOf(a.ctype) - ["standard", "normal", "emergency"].indexOf(b.ctype) || ["low", "medium", "high"].indexOf(a.risk) - ["low", "medium", "high"].indexOf(b.risk))
+        .map(m => `<tr data-mx="${m.ctype}|${m.risk}"><td>${esc(m.ctype)}</td><td>${sevBadge(m.risk)}</td>${Object.keys(CM_ROLES).map(r => `<td><input type="checkbox" data-r="${r}" ${m.steps.includes(r) ? "checked" : ""}></td>`).join("")}</tr>`).join("")}</table></div>
 
     <h2>Checklist items</h2>
     <div class="small muted" style="margin-bottom:6px">Readings outside the OK range open an issue automatically and feed the KPI charts. Leave site empty to use the item at every site.</div>
@@ -912,7 +1171,14 @@ async function viewAdmin() {
   $$("[data-p]").forEach(tr => $$("[data-f]", tr).forEach(inp => inp.onchange = async () => {
     const v = inp.type === "checkbox" ? inp.checked : inp.value || (inp.dataset.f === "site" ? null : "");
     await q(sb.from("profiles").update({ [inp.dataset.f]: v }).eq("id", tr.dataset.p));
+    if (tr.dataset.p === S.user.id) S.me[inp.dataset.f] = v;
     toast(inp.dataset.f === "active" && v ? "Switched on — use Reset password to send them a new password" : "Saved"); await refreshPeople();
+  }));
+  $$("[data-mx]").forEach(tr => $$("[data-r]", tr).forEach(cb => cb.onchange = async () => {
+    const [ctype, risk] = tr.dataset.mx.split("|");
+    const steps = Object.keys(CM_ROLES).filter(r => $(`[data-r="${r}"]`, tr).checked);
+    if (!steps.length && !confirm("With no approval step, this type of change is approved as soon as it is submitted. Continue?")) { cb.checked = true; return; }
+    await q(sb.from("change_matrix").update({ steps }).eq("ctype", ctype).eq("risk", risk)); CMX = null; toast("Saved");
   }));
   $("#addu").onsubmit = async e => {
     e.preventDefault();

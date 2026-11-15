@@ -152,3 +152,15 @@ table.t tr.click{cursor:pointer} table.t tr.click:hover td{background:#f5f8ff}
 }
 .ar{display:block;direction:rtl;text-align:right;font-size:.88em;color:#6B7280;font-weight:400;font-family:"Segoe UI",Tahoma,Arial,sans-serif}
 .area .ar{color:inherit;opacity:.8}
+/* change management */
+.c-draft,.c-cancelled{background:#eef1f5;color:#5b6577} .c-pending{background:#fff1d6;color:#8a5a00}
+.c-approved{background:#e5effd;color:#1c4ba0} .c-rejected{background:#fde2e2;color:#a01919}
+.c-in_progress{background:#ffe7cf;color:#9a4a00} .c-completed{background:#efe6fb;color:#5b2ca0} .c-closed{background:#dff3e7;color:#146c39}
+.track{display:flex;flex-wrap:wrap;gap:10px}
+.stp{display:flex;gap:10px;align-items:flex-start;border:1px solid var(--line);border-radius:10px;padding:9px 12px;min-width:190px;flex:1;background:#fff}
+.stp .n{width:26px;height:26px;border-radius:50%;display:grid;place-items:center;font-weight:700;font-size:13px;background:#eef1f5;color:var(--mute);flex:none}
+.stp.done{border-color:#b7e1c6;background:#f4fbf6} .stp.done .n{background:var(--ok);color:#fff}
+.stp.cur{border-color:var(--warn);box-shadow:0 0 0 2px #ffe8b3} .stp.cur .n{background:var(--warn);color:#fff}
+.stp.rej{border-color:#f0c4c4;background:#fff6f6} .stp.rej .n{background:var(--bad);color:#fff}
+.appr{margin-top:12px;border-top:1px solid var(--line);padding-top:12px}
+.tl .ev{padding:7px 0;border-bottom:1px dashed var(--line)} .tl .ev:last-child{border-bottom:0}
