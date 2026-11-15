@@ -174,7 +174,7 @@ async function boot(session) {
   const [sites, settings, people] = await Promise.all([
     q(sb.from("sites").select("*").order("sort")),
     q(sb.from("settings").select("*").eq("id", 1).maybeSingle()),
-    q(sb.from("profiles").select("id,full_name,role,is_dc,active,site,phone,cm_role").order("full_name"))
+    q(sb.from("profiles").select("id,full_name,role,is_dc,active,site,phone,cm_role,job").order("full_name"))
   ]);
   S.sites = sites; S.settings = settings || {}; S.people = people; document.title = BRAND();
   const saved = localStorage.getItem("dc_site");
@@ -237,6 +237,7 @@ async function refreshDots() {
       S.me.cm_role ? sb.from("changes").select("id,status,steps,step,requested_by").eq("status", "pending") : Promise.resolve({ data: [] })]);
     const set = (k, n) => { const d = $("#dot-" + k); if (d) { d.textContent = n; d.classList.toggle("hide", !n); } };
     set("issues", iss.count || 0); set("mfa", wit.count || 0); set("changes", (chg.data || []).filter(canApprove).length);
+    const nn = await sb.from("notifications").select("id", { count: "exact", head: true }).is("read_at", null); set("home", nn.count || 0);
   } catch (e) { }
 }
 addEventListener("hashchange", route);
@@ -263,6 +264,7 @@ async function viewHome() {
   let qk = sb.from("rack_usage").select("u_total,used_u,kw_cap,kw_used").eq("active", true);
   let qc = sb.from("changes").select("id,status,steps,step,requested_by,planned_start").in("status", ["pending", "approved", "in_progress", "completed"]);
   if (S.site) { qi = qi.eq("site", S.site); qr = qr.eq("site", S.site); qm = qm.eq("site", S.site); qk = qk.eq("site", S.site); qc = qc.eq("site", S.site); }
+  const notes = await sb.from("notifications").select("*").is("read_at", null).order("id", { ascending: false }).limit(20).then(r => r.data || []);
   const [iss, runs, open, racks, chg, mine] = await Promise.all([q(qi), q(qr), q(qm), q(qk), q(qc),
     q(sb.from("mfa_log").select("id,site,time_in,custodian,purpose,created_by").eq("witness_id", S.user.id).is("witness_confirmed_at", null))]);
   const cnt = s => iss.filter(i => i.severity === s).length;
@@ -270,7 +272,9 @@ async function viewHome() {
   const kC = racks.reduce((a, r) => a + (+r.kw_cap || 0), 0), kU = racks.reduce((a, r) => a + (+r.kw_used || 0), 0);
   const hrs = S.settings.mfa_open_hours || 4;
   const late = open.filter(m => Date.now() - new Date(m.time_in) > hrs * 3600000).length;
-  $("#view").innerHTML = `<h1>${esc(siteName(S.site))} — ${esc(fmtD(new Date()))}</h1>
+  $("#view").innerHTML = `${notes.length ? `<div class="card" style="border-left:5px solid var(--acc);margin-bottom:12px"><div class="row"><b>🔔 Notifications (${notes.length})</b><div class="grow"></div><button class="btn sm" id="nread">Mark all read</button></div>
+      ${notes.map(n => `<div style="padding:8px 0;border-top:1px solid var(--line)"><b>${esc(n.title)}</b> <span class="small muted">${fmtDT(n.created_at)}</span><div class="small" style="white-space:pre-wrap">${esc(n.body || "")}</div></div>`).join("")}</div>` : ""}
+    <h1>${esc(siteName(S.site))} — ${esc(fmtD(new Date()))}</h1>
     <div class="tiles">
       <div class="tile click ${iss.length ? "bad" : "good"}" data-go="issues"><div class="v">${iss.length}</div><div class="l">Open issues · ${cnt("critical")} critical · ${cnt("high")} high</div></div>
       <div class="tile click ${runs.some(r => r.signed_at) ? "good" : "warn"}" data-go="check"><div class="v">${runs.filter(r => r.signed_at).length}/${runs.length}</div><div class="l">Checklists signed today</div></div>
@@ -289,33 +293,53 @@ async function viewHome() {
       ${runs.map(r => `<tr class="click" data-run="${r.id}"><td>${esc(r.site)}</td><td>${esc(r.shift)}</td><td>${esc(r.tech_name)}</td><td>${fmtT(r.started_at)}</td><td>${r.signed_at ? `<span class="badge b-ok">Signed ${fmtT(r.signed_at)}</span>` : `<span class="badge b-wait">In progress</span>`}</td></tr>`).join("")}</table></div>`
       : `<div class="card muted">No checklist started today.${canEdit() ? ` <a href="#check">Start one</a>` : ""}</div>`}`;
   $$("[data-go]").forEach(b => b.onclick = () => location.hash = b.dataset.go);
+  const nr = $("#nread"); if (nr) nr.onclick = async () => { await q(sb.from("notifications").update({ read_at: new Date().toISOString() }).is("read_at", null)); route(); };
   $$("[data-issue]").forEach(r => r.onclick = () => openIssue(+r.dataset.issue));
   $$("[data-run]").forEach(r => r.onclick = () => location.hash = "run/" + r.dataset.run);
 }
 
 /* ---------------- CHECKLIST ---------------- */
+const JOBS = { technician: "Technician", engineer: "Engineer", supervisor: "Supervisor" };
+const KIND = { shift: "Shift checklist", engineer_round: "Engineer monthly round" };
 async function viewCheck() {
   if (needSite("Daily checklist")) return;
   const runs = await q(sb.from("checklist_runs").select("*").eq("site", S.site).order("started_at", { ascending: false }).limit(60));
   const h = +new Date().toLocaleString("en-GB", { timeZone: TZ, hour: "2-digit", hour12: false });
   const shift = h >= 7 && h < 15 ? "Morning" : h >= 15 && h < 23 ? "Evening" : "Night";
-  $("#view").innerHTML = `<h1>Daily checklist — ${esc(siteName(S.site))}</h1>
-    ${canEdit() ? `<div class="card"><form id="nf" class="row">
-      <label class="f grow">Technician<input type="text" id="nt" value="${esc(S.me.full_name)}" required></label>
-      <label class="f">Shift<select id="ns">${["Morning", "Evening", "Night"].map(s => `<option ${s === shift ? "selected" : ""}>${s}</option>`).join("")}</select></label>
-      <button class="btn acc">＋ Start checklist</button></form></div>` : ""}
+  const month = dayStr().slice(0, 7);
+  const round = runs.find(r => r.kind === "engineer_round" && (r.round_month || "").slice(0, 7) === month);
+  const job = S.me.job || "";
+  const canShift = canEdit() && (job === "technician" || isAdmin());
+  const canRound = canEdit() && (job === "engineer" || isAdmin()) && !round;
+  $("#view").innerHTML = `<h1>Checklists — ${esc(siteName(S.site))}</h1>
+    <div class="tiles" style="margin-bottom:12px">
+      <div class="tile ${round && round.signed_at ? "good" : "warn"}"><div class="v">${round ? (round.signed_at ? "Done" : "Started") : "Due"}</div>
+        <div class="l">Engineer monthly round — ${esc(new Date().toLocaleDateString("en-GB", { timeZone: TZ, month: "long", year: "numeric" }))}${round ? ` · ${esc(round.tech_name)}` : ""}</div></div>
+    </div>
+    ${canShift || canRound ? `<div class="card"><form id="nf" class="row" style="align-items:flex-end">
+      <div class="grow"><div class="small muted">On duty</div><b>${esc(S.me.full_name)}</b> · ${esc(showPhone(S.me.phone) || "")}${job ? ` · ${esc(JOBS[job])}` : ""}</div>
+      <label class="f">Type<select id="nk">${canShift ? `<option value="shift">${KIND.shift}</option>` : ""}${canRound ? `<option value="engineer_round">${KIND.engineer_round}</option>` : ""}</select></label>
+      <label class="f" id="nsl">Shift<select id="ns">${["Morning", "Evening", "Night"].map(s => `<option ${s === shift ? "selected" : ""}>${s}</option>`).join("")}</select></label>
+      <button class="btn acc">＋ Start</button></form>
+      <div class="small muted" style="margin-top:6px">Your name and mobile are recorded as the person on duty. Each shift the portal picks one item in every room at random that needs a photo, even when everything is normal.</div></div>`
+      : canEdit() ? `<div class="card small">Your account has no job set (Technician or Engineer). Ask the admin to set it in Admin → Users.</div>` : ""}
     <h2>Recent checklists</h2>
-    ${runs.length ? `<div class="tw"><table class="t"><tr><th>Date</th><th>Shift</th><th>Technician</th><th>Status</th></tr>
-    ${runs.map(r => `<tr class="click" data-run="${r.id}"><td class="nowrap">${fmtDT(r.started_at)}</td><td>${esc(r.shift)}</td><td>${esc(r.tech_name)}</td>
+    ${runs.length ? `<div class="tw"><table class="t"><tr><th>Date</th><th>Type</th><th>Shift</th><th>On duty</th><th>Mobile</th><th>Status</th></tr>
+    ${runs.map(r => `<tr class="click" data-run="${r.id}"><td class="nowrap">${fmtDT(r.started_at)}</td><td>${r.kind === "engineer_round" ? `<span class="badge b-low">Engineer round</span>` : "Shift"}</td><td>${r.kind === "engineer_round" ? "" : esc(r.shift)}</td><td>${esc(r.tech_name)}</td><td class="nowrap">${esc(showPhone(r.tech_phone) || "")}</td>
       <td>${r.signed_at ? `<span class="badge b-ok">Signed ${fmtDT(r.signed_at)}</span>` : `<span class="badge b-wait">In progress</span>`}</td></tr>`).join("")}</table></div>`
       : `<div class="card muted">No checklists yet.</div>`}`;
   $$("[data-run]").forEach(r => r.onclick = () => location.hash = "run/" + r.dataset.run);
   const nf = $("#nf");
-  if (nf) nf.onsubmit = async e => {
-    e.preventDefault();
-    const r = await q(sb.from("checklist_runs").insert({ site: S.site, shift: $("#ns").value, tech_name: $("#nt").value.trim(), created_by: S.user.id }).select("id").single());
-    location.hash = "run/" + r.id;
-  };
+  if (nf) {
+    const sync = () => { $("#nsl").style.display = $("#nk").value === "shift" ? "" : "none"; };
+    $("#nk").onchange = sync; sync();
+    nf.onsubmit = async e => {
+      e.preventDefault();
+      const kind = $("#nk").value;
+      const r = await q(sb.from("checklist_runs").insert({ site: S.site, kind, shift: kind === "shift" ? $("#ns").value : "Morning", tech_name: S.me.full_name, created_by: S.user.id }).select("id").single());
+      location.hash = "run/" + r.id;
+    };
+  }
 }
 
 async function viewRun(id) {
@@ -330,6 +354,8 @@ async function viewRun(id) {
   const locked = !!run.signed_at && !isAdmin();
   const editable = canEdit() && !locked && (run.created_by === S.user.id || isAdmin());
   const areas = [...new Set(items.map(i => i.area))];
+  const PH = new Set((run.photo_items || []).map(Number));
+  const needPhoto = it => it.photo_required || PH.has(it.id);
   const itemHTML = it => {
     const r = R[it.id] || {};
     const cls = r.ok === true ? "okk" : r.ok === false ? "bad" : "";
@@ -339,18 +365,18 @@ async function viewRun(id) {
          <span class="range">${esc(it.unit || "")}${it.min_ok !== null || it.max_ok !== null ? ` · ok ${it.min_ok ?? "…"}–${it.max_ok ?? "…"}` : ""}</span>`;
     const ph = r.photo_id && photoCache[r.photo_id] ? `<img class="thumb" src="${photoCache[r.photo_id]}" alt="">` : "";
     return `<div class="item ${cls}" data-item="${it.id}">
-      <div class="ttl">${esc(it.title)}${it.title_ar ? `<span class="ar">${esc(it.title_ar)}</span>` : ""}${it.photo_required ? `<span class="req">📷 photo required</span>` : ""}</div>
+      <div class="ttl">${esc(it.title)}${it.title_ar ? `<span class="ar">${esc(it.title_ar)}</span>` : ""}${it.photo_required ? `<span class="req">📷 photo required</span>` : PH.has(it.id) ? `<span class="req">📷 photo this shift</span>` : ""}</div>
       <div class="ctl">${ctl}</div>
       <div class="extra"><input type="text" class="note" placeholder="Note (optional)" value="${esc(r.note || "")}" ${editable ? "" : "disabled"}>
         ${editable ? camButton('class="camin"') : ""}<span class="ph">${ph}</span></div></div>`;
   };
   $("#view").innerHTML = `<div class="row"><a href="#check" class="btn sm">← Back</a><div class="grow"></div>
       <button class="btn sm" id="prt">🖨 Print / PDF</button>${isAdmin() ? `<button class="btn sm danger" id="del">Delete</button>` : ""}</div>
-    <h1 style="margin-top:12px">${esc(run.site)} · ${esc(run.shift)} checklist</h1>
-    <div class="muted">${esc(run.tech_name)} · started ${fmtDT(run.started_at)} ·
+    <h1 style="margin-top:12px">${esc(run.site)} · ${run.kind === "engineer_round" ? "Engineer monthly round" : esc(run.shift) + " shift checklist"}</h1>
+    <div class="muted">On duty: <b>${esc(run.tech_name)}</b>${run.tech_phone ? ` · ${esc(showPhone(run.tech_phone))}` : ""} · started ${fmtDT(run.started_at)} · ${PH.size} room photo(s) asked ·
       ${run.signed_at ? `<span class="badge b-ok">Signed ${fmtDT(run.signed_at)}</span>` : `<span class="badge b-wait">In progress</span>`}
       · <span id="prog"></span></div>
-    ${!editable && !run.signed_at ? `<div class="card small" style="margin-top:10px">Only the technician who started this checklist (or an admin) can fill it.</div>` : ""}
+    ${!editable && !run.signed_at ? `<div class="card small" style="margin-top:10px">Only the person on duty who started this checklist (or an admin) can fill it.</div>` : ""}
     <div id="items">${areas.map(a => { const f = items.find(i => i.area === a); return `<div class="area">${esc(a)}${f && f.area_ar ? `<span class="ar">${esc(f.area_ar)}</span>` : ""}</div>` + items.filter(i => i.area === a).map(itemHTML).join(""); }).join("")}</div>
     ${editable && !run.signed_at ? `<div class="stick"><button class="btn ok" id="sign">✍ Sign & lock checklist</button></div>` : ""}`;
 
@@ -402,7 +428,7 @@ async function viewRun(id) {
     if (!res.ok) {
       items.forEach(i => {
         const r = R[i.id] || {};
-        const miss = r.ok === null || r.ok === undefined || (i.photo_required && !r.photo_id);
+        const miss = r.ok === null || r.ok === undefined || (needPhoto(i) && !r.photo_id);
         $(`.item[data-item="${i.id}"]`).classList.toggle("miss", miss);
       });
       const first = $(".item.miss"); if (first) first.scrollIntoView({ behavior: "smooth", block: "center" });
@@ -410,22 +436,23 @@ async function viewRun(id) {
     }
     toast("Checklist signed ✓"); route();
   };
-  $("#prt").onclick = () => printRun(run, items, R);
+  $("#prt").onclick = () => printRun(run, items, R, PH);
   const del = $("#del");
   if (del) del.onclick = async () => {
     if (!confirm("Delete this checklist and all its answers?")) return;
     await q(sb.from("checklist_runs").delete().eq("id", id)); location.hash = "check";
   };
 }
-function printRun(run, items, R) {
-  printHTML(`<h1>${esc(BRAND())} — Daily Checklist</h1>
-    <div class="meta">Site: <b>${esc(siteName(run.site))}</b> · Shift: <b>${esc(run.shift)}</b> · Technician: <b>${esc(run.tech_name)}</b><br>
+function printRun(run, items, R, PH) {
+  PH = PH || new Set();
+  printHTML(`<h1>${esc(BRAND())} — ${run.kind === "engineer_round" ? "Engineer Monthly Round" : "Daily Checklist"}</h1>
+    <div class="meta">Site: <b>${esc(siteName(run.site))}</b> · ${run.kind === "engineer_round" ? "Month: <b>" + esc((run.round_month || "").slice(0, 7)) + "</b>" : "Shift: <b>" + esc(run.shift) + "</b>"} · On duty: <b>${esc(run.tech_name)}</b> · Mobile: <b>${esc(showPhone(run.tech_phone) || "")}</b><br>
     Started: ${fmtDT(run.started_at)} · ${run.signed_at ? "Signed: " + fmtDT(run.signed_at) : "NOT SIGNED"}</div>
     <table><tr><th>Area</th><th>Item</th><th>Result</th><th>Value</th><th>Note</th><th>Photo</th></tr>
     ${items.map(i => { const r = R[i.id] || {}; return `<tr><td>${esc(i.area)}</td><td>${esc(i.title)}</td>
       <td>${r.ok === true ? "OK" : r.ok === false ? "<b>NOT OK</b>" : "—"}</td>
       <td>${r.value ?? ""} ${r.value !== null && r.value !== undefined ? esc(i.unit || "") : ""}</td><td>${esc(r.note || "")}</td>
-      <td>${r.photo_id && photoCache[r.photo_id] ? `<img src="${photoCache[r.photo_id]}">` : ""}</td></tr>`; }).join("")}</table>
+      <td>${r.photo_id && photoCache[r.photo_id] ? `<img src="${photoCache[r.photo_id]}">` : PH.has(i.id) ? "<b>MISSING</b>" : ""}</td></tr>`; }).join("")}</table>
     <p style="margin-top:14px">Printed ${fmtDT(new Date())} by ${esc(S.me.full_name)}</p>`);
 }
 
@@ -732,7 +759,19 @@ async function openIssue(id) {
     <label class="f">Details<textarea id="id" ${ro ? "disabled" : ""}>${esc(i.detail || "")}</textarea></label>
     <label class="f">Resolution / action taken<textarea id="ir" ${ro ? "disabled" : ""}>${esc(i.resolution || "")}</textarea></label>
     <div class="row"><span id="iph">${photoId && photoCache[photoId] ? `<img class="thumb" src="${photoCache[photoId]}" alt="">` : ""}</span>
-      ${ro ? "" : camButton('id="icam"')}<div class="grow"></div>${ro ? "" : `<button class="btn pri">Save</button>`}</div></form>`);
+      ${ro ? "" : camButton('id="icam"')}<div class="grow"></div>${id && isAdmin() ? `<button type="button" class="btn danger" id="idel">🗑 Delete</button>` : ""}${ro ? "" : `<button class="btn pri">Save</button>`}</div></form>`);
+  const idel = $("#idel");
+  if (idel) idel.onclick = async () => {
+    const why = prompt(`Delete issue #${id}? The DC Manager is notified.\nWrite the reason:`);
+    if (why === null) return;
+    if (!why.trim()) return toast("Write the reason", true);
+    const r = await q(sb.rpc("delete_issue", { p_id: id, p_reason: why.trim() }));
+    const msg = `${BRAND()} — issue #${id} deleted by ${S.me.full_name}\n${i.site} · ${i.severity} · ${i.title}\nReason: ${why.trim()}`;
+    modal(`<h2 style="margin-top:0">Issue #${id} deleted</h2><p>It is kept in the deleted-issues bin and the DC Manager got a notification in the portal.</p>
+      ${r.managers.length ? `<div class="small muted" style="margin-bottom:6px">Also tell them on WhatsApp:</div><div class="row">${r.managers.map(m => `<a class="btn sm pri" target="_blank" rel="noopener" href="https://wa.me/${esc(m.phone)}?text=${encodeURIComponent(msg)}">💬 ${esc(m.name)}</a>`).join("")}</div>` : ""}
+      <div class="row" style="margin-top:12px"><button class="btn" data-close>Done</button></div>`);
+    route();
+  };
   const bindImg = () => { const im = $("#iph img"); if (im) im.onclick = () => showImg(im.src); };
   bindImg();
   const cam = $("#icam");
@@ -1090,7 +1129,7 @@ function hbars(obj) {
 }
 
 /* ---------------- ADMIN ---------------- */
-async function refreshPeople() { S.people = await q(sb.from("profiles").select("id,full_name,role,is_dc,active,site,phone,cm_role").order("full_name")); }
+async function refreshPeople() { S.people = await q(sb.from("profiles").select("id,full_name,role,is_dc,active,site,phone,cm_role,job").order("full_name")); }
 function credsModal(r, isNew) {
   const url = location.origin + location.pathname;
   const msg = `${BRAND()} portal\n${url}\n\nSign in with:\nWhatsApp number: ${showPhone(r.phone)}\nTemporary password: ${r.password}\n\nYou will choose your own password after signing in.`;
@@ -1122,9 +1161,10 @@ async function viewAdmin() {
       <label class="f" style="flex-direction:row;align-items:center;gap:8px"><input type="checkbox" id="u_dc" checked> DC rep (may sign as MFA witness)</label>
       <div class="row" style="align-items:flex-end"><button class="btn pri">+ Add person</button></div></form>
       <div class="small muted" style="margin-top:6px">People sign in with their WhatsApp number and password. After adding someone you can send them their login on WhatsApp; they choose their own password the first time.</div></div>
-    <div class="tw"><table class="t"><tr><th>Name</th><th>WhatsApp</th><th>Role</th><th>Change approver</th><th>DC rep</th><th>Home site</th><th>Active</th><th></th></tr>
+    <div class="tw"><table class="t"><tr><th>Name</th><th>WhatsApp</th><th>Role</th><th>Job</th><th>Change approver</th><th>DC rep</th><th>Home site</th><th>Active</th><th></th></tr>
       ${people.map(p => `<tr data-p="${p.id}"><td><input type="text" data-f="full_name" value="${esc(p.full_name)}"></td><td class="small nowrap">${esc(showPhone(p.phone) || p.email || "")}${p.must_change_pw ? ` <span class="badge" title="Has not chosen a password yet">new</span>` : ""}</td>
         <td><select data-f="role">${["admin", "operator", "viewer"].map(r => `<option ${r === p.role ? "selected" : ""}>${r}</option>`).join("")}</select></td>
+        <td><select data-f="job"><option value="">—</option>${Object.entries(JOBS).map(([k, v]) => `<option value="${k}" ${k === p.job ? "selected" : ""}>${v}</option>`).join("")}</select></td>
         <td><select data-f="cm_role"><option value="">—</option>${Object.entries(CM_ROLES).map(([k, v]) => `<option value="${k}" ${k === p.cm_role ? "selected" : ""}>${v}</option>`).join("")}</select></td>
         <td><input type="checkbox" data-f="is_dc" ${p.is_dc ? "checked" : ""}></td>
         <td><select data-f="site"><option value="">—</option>${S.sites.map(s => `<option ${s.id === p.site ? "selected" : ""}>${esc(s.id)}</option>`).join("")}</select></td>
@@ -1154,7 +1194,15 @@ async function viewAdmin() {
       <label class="f">Keep photos for (days)<input type="number" id="s3" min="7" max="3650" value="${st.photo_keep_days}"></label>
       <label class="f">Rack power alert at (% of capacity)<input type="number" id="s4" min="50" max="100" value="${st.rack_kw_alert_pct}"></label>
       <label class="f">MFA session flagged after (hours)<input type="number" id="s5" min="1" max="72" value="${st.mfa_open_hours}"></label>
+      <label class="f">Monthly pack goes to (comma between e-mails)<input type="text" id="s6" value="${esc(st.report_emails || "")}"></label>
       <div class="row" style="align-items:flex-end"><button class="btn pri">Save settings</button></div></form></div>
+
+    <h2>Monthly pack</h2>
+    <div class="card"><div class="row" style="align-items:flex-end">
+      <label class="f">Month<input type="month" id="mpm" value="${addDays(dayStr().slice(0, 8) + "01", -1).slice(0, 7)}"></label>
+      <button class="btn" id="mpv">👁 Preview / print</button><button class="btn pri" id="mps">✉ Send now</button></div>
+      <div class="small muted">Sent by itself on the 1st of every month at 08:00 to: <b>${esc(st.report_emails || "—")}</b>. Holds shift presence with technician names and mobiles, missing shifts, the engineer round, items not OK, room photo coverage, the MFA register and changes.</div>
+      <div class="small" id="mplog" style="margin-top:6px"></div></div>
 
     <h2>Database space</h2>
     <div class="card"><div class="row"><b>${use.db_mb} MB</b><span class="muted">used of the 500 MB free plan</span></div>
@@ -1162,6 +1210,9 @@ async function viewAdmin() {
       <div class="small">Photos: ${use.photo_mb} MB (${use.photos}) of ${use.budget_mb} MB budget (${pctUse}%) — oldest photos are removed first when full. Logs are never removed.</div>
       <div class="small muted" style="margin-top:6px">${use.runs} checklists · ${use.results} answers · ${use.issues} issues · ${use.mfa} MFA entries · ${use.devices} rack devices · ${use.audit} audit records</div>
       <div class="row" style="margin-top:10px"><button class="btn sm" id="bk">⬇ Full backup (JSON, without photos)</button><button class="btn sm" id="bkp">⬇ Backup with photos</button></div></div>
+
+    <h2>Deleted issues</h2>
+    <div id="dbin" class="small muted">Loading…</div>
 
     <h2>Audit log <span class="small muted">(last 150 changes)</span></h2>
     <div class="tw"><table class="t"><tr><th>When</th><th>Who</th><th>What</th><th>Change</th></tr>
@@ -1228,9 +1279,27 @@ async function viewAdmin() {
     await q(sb.from("sites").insert({ id, name, sort: +$('[data-f="sort"]', tr).value || 0 }));
     S.sites = await q(sb.from("sites").select("*").order("sort")); shell(); route();
   };
+  sb.from("deleted_issues").select("*").order("id", { ascending: false }).limit(50).then(({ data }) => {
+    const el = $("#dbin"); if (!el) return;
+    el.outerHTML = data && data.length ? `<div class="tw"><table class="t"><tr><th>Deleted</th><th>By</th><th>Issue</th><th>Site</th><th>Title</th><th>Reason</th></tr>${data.map(d => `<tr><td class="nowrap">${fmtDT(d.deleted_at)}</td><td>${esc(d.deleted_by_name || "")}</td><td>#${d.issue_id}</td><td>${esc(d.site || "")}</td><td>${esc(d.title || "")}</td><td>${esc(d.reason)}</td></tr>`).join("")}</table></div>` : `<div class="card muted">No issues deleted.</div>`;
+  });
+  const mpMonth = () => $("#mpm").value + "-01";
+  $("#mpv").onclick = async () => {
+    const html = await q(sb.rpc("monthly_pack", { p_month: mpMonth() }));
+    const w = window.open(URL.createObjectURL(new Blob([html], { type: "text/html" })), "_blank");
+    if (!w) toast("Allow pop-ups to see the preview", true);
+  };
+  $("#mps").onclick = async () => {
+    if (!confirm(`Send the ${$("#mpm").value} pack now to ${S.settings.report_emails}?`)) return;
+    const r = await q(sb.rpc("send_monthly_pack", { p_month: mpMonth() }));
+    toast("Monthly pack sent to " + r.to.join(", ")); route();
+  };
+  sb.from("report_log").select("*").order("id", { ascending: false }).limit(5).then(({ data }) => {
+    const el = $("#mplog"); if (el && data && data.length) el.innerHTML = "Last sent: " + data.map(l => `${esc(l.month.slice(0, 7))} → ${fmtDT(l.sent_at)}`).join(" · ");
+  });
   $("#stf").onsubmit = async e => {
     e.preventDefault();
-    const row = { idle_minutes: +$("#s1").value, photo_budget_mb: +$("#s2").value, photo_keep_days: +$("#s3").value, rack_kw_alert_pct: +$("#s4").value, mfa_open_hours: +$("#s5").value };
+    const row = { idle_minutes: +$("#s1").value, photo_budget_mb: +$("#s2").value, photo_keep_days: +$("#s3").value, rack_kw_alert_pct: +$("#s4").value, mfa_open_hours: +$("#s5").value, report_emails: $("#s6").value.trim() };
     await q(sb.from("settings").update(row).eq("id", 1)); Object.assign(S.settings, row); bumpIdle(); toast("Settings saved");
   };
   const backup = async withPhotos => {
